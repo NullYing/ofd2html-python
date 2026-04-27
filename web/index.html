@@ -86,6 +86,9 @@
           <input id="file" type="file" accept=".ofd,application/octet-stream" disabled />
         </label>
         <button id="download" disabled>下载 HTML</button>
+        <button id="print" disabled>打印</button>
+        <button id="pdf" disabled>导出 PDF</button>
+        <button id="png" disabled>导出 PNG</button>
         <span class="hint" id="filename"></span>
       </div>
     </div>
@@ -100,6 +103,7 @@
   </main>
 
   <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

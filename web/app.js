@@ -61,7 +61,7 @@ await micropip.install(${JSON.stringify(wheelUrl)}, deps=False)
 async function convert(file) {
     if (!pyodide) return;
     status("读取文件…");
-    $("download").disabled = true;
+    setExportButtonsEnabled(false);
     $("preview").srcdoc = "";
     lastHtml = null;
     lastName = file.name.replace(/\.ofd$/i, "") || "converted";
@@ -83,7 +83,12 @@ _ofd2html_out
         log("[ok] 转换完成，HTML " + html.length.toLocaleString() + " chars，用时 " + ms + " ms");
         lastHtml = html;
         $("preview").srcdoc = html;
-        $("download").disabled = false;
+        // Wait for the iframe to parse the new srcdoc before enabling the
+        // export buttons (they depend on querying SVGs from inside it).
+        await new Promise((resolve) => {
+            $("preview").addEventListener("load", resolve, { once: true });
+        });
+        setExportButtonsEnabled(true);
         status("转换完成");
     } catch (err) {
         status("转换失败");
@@ -105,10 +110,198 @@ function download() {
     URL.revokeObjectURL(url);
 }
 
+// --------------------------------------------------------------------------
+// Print / PDF / PNG export
+//
+// The converted HTML wraps each OFD page in a <div> containing exactly one
+// <svg width="Wmm" height="Hmm" viewBox="0 0 W H"> element. We collect those
+// SVGs from the preview <iframe> and rasterize them client-side.
+// --------------------------------------------------------------------------
+
+const MM_PER_INCH = 25.4;
+const RENDER_DPI = 200;          // raster DPI for PDF/PNG output
+
+function getPreviewDoc() {
+    const iframe = $("preview");
+    const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+    if (!doc || !doc.body) throw new Error("预览尚未就绪");
+    return doc;
+}
+
+function getPageSvgs() {
+    const doc = getPreviewDoc();
+    const svgs = Array.from(doc.querySelectorAll("svg"));
+    if (svgs.length === 0) throw new Error("未找到页面 SVG");
+    return svgs;
+}
+
+/** Parse "210mm" → 210 (number, in millimetres). Returns NaN if no unit. */
+function parseMm(value) {
+    if (!value) return NaN;
+    const m = String(value).match(/([-+]?[0-9]*\.?[0-9]+)\s*mm/i);
+    return m ? parseFloat(m[1]) : NaN;
+}
+
+/** Read a page SVG's physical size in millimetres. */
+function svgSizeMm(svg) {
+    let w = parseMm(svg.getAttribute("width"));
+    let h = parseMm(svg.getAttribute("height"));
+    if (!isFinite(w) || !isFinite(h)) {
+        const vb = (svg.getAttribute("viewBox") || "").split(/[\s,]+/).map(Number);
+        if (vb.length === 4) { w = vb[2]; h = vb[3]; }
+    }
+    if (!isFinite(w) || !isFinite(h) || w <= 0 || h <= 0) {
+        throw new Error("无法解析 SVG 物理尺寸");
+    }
+    return { w, h };
+}
+
+/**
+ * Rasterize an SVG element to a PNG data URL at the requested DPI.
+ *
+ * We serialize the SVG (with explicit pixel width/height to control output
+ * resolution), draw it onto a Canvas via an <img>, then export as PNG.
+ */
+function svgToPngDataUrl(svg, widthMm, heightMm, dpi) {
+    const pxW = Math.max(1, Math.round((widthMm / MM_PER_INCH) * dpi));
+    const pxH = Math.max(1, Math.round((heightMm / MM_PER_INCH) * dpi));
+
+    // Clone so we can force pixel dimensions without mutating the preview.
+    const clone = svg.cloneNode(true);
+    if (!clone.getAttribute("xmlns")) clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("width", pxW);
+    clone.setAttribute("height", pxH);
+
+    const xml = new XMLSerializer().serializeToString(clone);
+    const blob = new Blob([xml], { type: "image/svg+xml;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const canvas = document.createElement("canvas");
+                canvas.width = pxW;
+                canvas.height = pxH;
+                const ctx = canvas.getContext("2d");
+                ctx.fillStyle = "#fff";
+                ctx.fillRect(0, 0, pxW, pxH);
+                ctx.drawImage(img, 0, 0, pxW, pxH);
+                URL.revokeObjectURL(url);
+                resolve({ dataUrl: canvas.toDataURL("image/png"), pxW, pxH });
+            } catch (e) {
+                URL.revokeObjectURL(url);
+                reject(e);
+            }
+        };
+        img.onerror = (e) => {
+            URL.revokeObjectURL(url);
+            reject(new Error("SVG 光栅化失败：" + (e && e.message ? e.message : e)));
+        };
+        img.src = url;
+    });
+}
+
+function saveDataUrl(dataUrl, filename) {
+    const a = document.createElement("a");
+    a.href = dataUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+async function printPreview() {
+    try {
+        const iframe = $("preview");
+        const win = iframe.contentWindow;
+        if (!win) throw new Error("预览未就绪");
+        // Hide drop-shadows etc. when printing to avoid grey backgrounds.
+        const doc = getPreviewDoc();
+        if (!doc.getElementById("__ofd2html_print_style")) {
+            const st = doc.createElement("style");
+            st.id = "__ofd2html_print_style";
+            st.textContent =
+                "@media print {" +
+                "  html, body { background: #fff !important; margin: 0 !important; }" +
+                "  body > div { gap: 0 !important; }" +
+                "  body * { box-shadow: none !important; }" +
+                "  @page { margin: 0; }" +
+                "}";
+            doc.head.appendChild(st);
+        }
+        win.focus();
+        win.print();
+    } catch (err) {
+        log("[err] 打印失败：" + err);
+    }
+}
+
+async function exportPdf() {
+    try {
+        if (!window.jspdf || !window.jspdf.jsPDF) throw new Error("jsPDF 未加载");
+        const { jsPDF } = window.jspdf;
+        const svgs = getPageSvgs();
+        status("生成 PDF（" + svgs.length + " 页）…");
+        let pdf = null;
+        for (let i = 0; i < svgs.length; i++) {
+            const { w, h } = svgSizeMm(svgs[i]);
+            const { dataUrl } = await svgToPngDataUrl(svgs[i], w, h, RENDER_DPI);
+            if (!pdf) {
+                pdf = new jsPDF({
+                    unit: "mm",
+                    format: [w, h],
+                    orientation: w >= h ? "landscape" : "portrait",
+                    compress: true,
+                });
+            } else {
+                pdf.addPage([w, h], w >= h ? "landscape" : "portrait");
+            }
+            pdf.addImage(dataUrl, "PNG", 0, 0, w, h, undefined, "FAST");
+            log("[pdf] 页 " + (i + 1) + "/" + svgs.length + " 完成 (" + w.toFixed(1) + "x" + h.toFixed(1) + " mm)");
+        }
+        pdf.save(lastName + ".pdf");
+        status("PDF 已下载");
+    } catch (err) {
+        status("PDF 导出失败");
+        log("[err] " + err);
+    }
+}
+
+async function exportPng() {
+    try {
+        const svgs = getPageSvgs();
+        status("生成 PNG（" + svgs.length + " 页）…");
+        for (let i = 0; i < svgs.length; i++) {
+            const { w, h } = svgSizeMm(svgs[i]);
+            const { dataUrl } = await svgToPngDataUrl(svgs[i], w, h, RENDER_DPI);
+            const suffix = svgs.length > 1
+                ? "-page-" + String(i + 1).padStart(String(svgs.length).length, "0")
+                : "";
+            saveDataUrl(dataUrl, lastName + suffix + ".png");
+            log("[png] 页 " + (i + 1) + "/" + svgs.length + " 已下载");
+        }
+        status("PNG 已下载");
+    } catch (err) {
+        status("PNG 导出失败");
+        log("[err] " + err);
+    }
+}
+
+function setExportButtonsEnabled(enabled) {
+    for (const id of ["download", "print", "pdf", "png"]) {
+        const el = $(id);
+        if (el) el.disabled = !enabled;
+    }
+}
+
 $("file").addEventListener("change", (e) => {
     const f = e.target.files && e.target.files[0];
     if (f) convert(f);
 });
 $("download").addEventListener("click", download);
+$("print").addEventListener("click", printPreview);
+$("pdf").addEventListener("click", exportPdf);
+$("png").addEventListener("click", exportPng);
 
 boot();
