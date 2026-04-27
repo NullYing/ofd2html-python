@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>OFD → HTML 在线转换 (Pyodide)</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #f6f7f9;
+      color: #1f2328;
+      min-height: 100vh;
+    }
+    header {
+      padding: 16px 24px;
+      background: #fff;
+      border-bottom: 1px solid #e5e7eb;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    header h1 { font-size: 16px; margin: 0; }
+    main { padding: 16px 24px 32px; max-width: 1200px; margin: 0 auto; }
+    .panel {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button, label.file-btn {
+      padding: 8px 14px;
+      border-radius: 6px;
+      border: 1px solid #d0d7de;
+      background: #f6f8fa;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    button.primary { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+    label.file-btn input { display: none; }
+    #status {
+      font-size: 13px;
+      color: #57606a;
+      margin-left: auto;
+      white-space: pre-wrap;
+    }
+    #log {
+      font: 12px/1.5 ui-monospace, Consolas, monospace;
+      background: #0d1117;
+      color: #c9d1d9;
+      padding: 12px;
+      border-radius: 6px;
+      max-height: 160px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    iframe#preview {
+      width: 100%;
+      height: 75vh;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      background: #fff;
+    }
+    .hint { font-size: 12px; color: #57606a; }
+    a { color: #1f6feb; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OFD → HTML 在线转换</h1>
+    <span class="hint">完全在浏览器内运行（Pyodide + ofd2html），文件不会上传。</span>
+    <span id="status">初始化中…</span>
+  </header>
+
+  <main>
+    <div class="panel">
+      <div class="row">
+        <label class="file-btn">
+          选择 .ofd 文件
+          <input id="file" type="file" accept=".ofd,application/octet-stream" disabled />
+        </label>
+        <button id="download" disabled>下载 HTML</button>
+        <span class="hint" id="filename"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div id="log">[启动] 加载 Pyodide…</div>
+    </div>
+
+    <div class="panel">
+      <iframe id="preview" title="预览" sandbox="allow-same-origin"></iframe>
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
