@@ -112,7 +112,7 @@ def _render_node(
     elif tag == "PathObject":
         out.append(_render_path_object(node, doc, layer_dp))
     elif tag == "TextObject":
-        out.append(_render_text_object(node))
+        out.append(_render_text_object(node, doc, layer_dp))
     elif tag == "ImageObject":
         out.append(_render_image_object(node, reader, doc))
     # Unknown nodes are silently skipped so future OFD features
@@ -207,7 +207,11 @@ def _render_path_object(
 # --------------------------------------------------------------------------- #
 
 
-def _render_text_object(node: etree._Element) -> str:
+def _render_text_object(
+    node: etree._Element,
+    doc: Document,
+    layer_dp: Optional[DrawParam] = None,
+) -> str:
     boundary = Box.parse(node.get("Boundary"))
     ctm = node.get("CTM")
     size_raw = node.get("Size") or "3"
@@ -218,7 +222,21 @@ def _render_text_object(node: etree._Element) -> str:
     weight = node.get("Weight") or ""
     italic = (node.get("Italic") or "").lower() == "true"
 
-    fill_color = parse_color(_xpath_attr(node, "ofd:FillColor", "Value"), "#000000")
+    # Fill colour precedence (mirrors the reference JS renderer):
+    #   explicit <ofd:FillColor Value=...> on the TextObject
+    #   > DrawParam referenced by the TextObject's @DrawParam
+    #   > DrawParam inherited from the enclosing Layer's @DrawParam
+    #   > spec default (black).
+    # Without the DrawParam fallbacks the brown / coloured labels in many
+    # form-style OFDs (e.g. 航空运输电子客票行程单) render entirely in black.
+    text_dp = doc.resolve_draw_param(node.get("DrawParam"))
+    explicit_fill = _xpath_attr(node, "ofd:FillColor", "Value")
+    dp_fill: Optional[str] = None
+    for dp in (layer_dp, text_dp):
+        if dp is not None and dp.fill_color is not None:
+            dp_fill = dp.fill_color
+    fill_value = explicit_fill or dp_fill
+    fill_color = parse_color(fill_value, "#000000")
 
     transform = _build_transform(boundary, ctm)
 
