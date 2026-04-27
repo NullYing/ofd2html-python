@@ -58,10 +58,77 @@ class MediaRes:
 
 
 @dataclass
+class DrawParam:
+    """Subset of OFD ``CT_DrawParam`` needed for HTML rendering.
+
+    OFD allows ``Relative`` to chain a base DrawParam; we keep the raw id
+    here and resolve transitively via :meth:`Document.resolve_draw_param`
+    so callers always see the merged effective values.
+    """
+
+    res_id: str
+    relative: Optional[str] = None
+    line_width: Optional[float] = None
+    fill_color: Optional[str] = None  # raw ``Value`` channel string, e.g. "255 0 0"
+    stroke_color: Optional[str] = None
+
+
+@dataclass
+class TemplatePage:
+    """Reusable page-content shared by multiple pages.
+
+    A page references it via ``<ofd:Template TemplateID="..." ZOrder="..."/>``
+    and the renderer composites the template content under or over the page's
+    own content according to ``ZOrder`` (Background / Body / Foreground).
+    """
+
+    template_id: str
+    base_loc: str  # absolute virtual path to the template's Content.xml
+    z_order: str = "Background"
+
+
+@dataclass
 class Document:
     physical_box: Box
     pages: list[PageRef] = field(default_factory=list)
     medias: dict[str, MediaRes] = field(default_factory=dict)
+    draw_params: dict[str, DrawParam] = field(default_factory=dict)
+    templates: dict[str, TemplatePage] = field(default_factory=dict)
+
+    def resolve_draw_param(self, res_id: Optional[str]) -> Optional[DrawParam]:
+        """Return a flattened ``DrawParam`` with ``Relative`` chain merged in.
+
+        The OFD spec lets a DrawParam inherit from a base via ``Relative`` and
+        override individual properties. We walk the chain (base-first), then
+        let the leaf override -- mirroring the reference renderer behaviour.
+        Returns ``None`` for unknown ids so callers can do a single guarded
+        lookup.
+        """
+        if not res_id:
+            return None
+        leaf = self.draw_params.get(res_id)
+        if leaf is None:
+            return None
+        chain: list[DrawParam] = [leaf]
+        seen = {res_id}
+        cur = leaf
+        while cur.relative and cur.relative not in seen:
+            base = self.draw_params.get(cur.relative)
+            if base is None:
+                break
+            seen.add(cur.relative)
+            chain.append(base)
+            cur = base
+        # Walk base-first, then leaf, so leaf overrides win.
+        merged = DrawParam(res_id=res_id)
+        for dp in reversed(chain):
+            if dp.line_width is not None:
+                merged.line_width = dp.line_width
+            if dp.fill_color is not None:
+                merged.fill_color = dp.fill_color
+            if dp.stroke_color is not None:
+                merged.stroke_color = dp.stroke_color
+        return merged
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +155,25 @@ class OFDReader:
         del doc  # currently unused, but kept for future multi-doc routing
         xml = self._container.read(page.base_loc.lstrip("/"))
         return etree.fromstring(xml)
+
+    def template_content(
+        self, doc: Document, template_id: str
+    ) -> Optional[etree._Element]:
+        """Return the parsed root element of the template page identified by
+        ``template_id`` (or ``None`` if unknown / missing)."""
+        del doc
+        tpl = self._documents[0].templates.get(template_id) if self._documents else None
+        # Search across all documents because ``doc`` is currently unused above.
+        for d in self._documents:
+            tpl = d.templates.get(template_id)
+            if tpl is not None:
+                break
+        if tpl is None:
+            return None
+        path = tpl.base_loc.lstrip("/")
+        if not self._container.has(path):
+            return None
+        return etree.fromstring(self._container.read(path))
 
     def read_media(self, doc: Document, res_id: str) -> Optional[bytes]:
         media = doc.medias.get(res_id)
@@ -150,16 +236,45 @@ class OFDReader:
         # Resources (PublicRes + DocumentRes). Each entry can declare
         # ``BaseLoc`` to relocate sub-files relative to the resource file.
         medias: dict[str, MediaRes] = {}
+        draw_params: dict[str, DrawParam] = {}
         for tag in ("ofd:PublicRes", "ofd:DocumentRes"):
             for res_el in doc_el.findall(f".//ofd:CommonData/{tag}", NSMAP):
                 if not res_el.text:
                     continue
                 res_path = _join_doc(doc_dir, res_el.text.strip())
-                self._collect_medias(res_path, medias)
+                self._collect_resources(res_path, medias, draw_params)
 
-        return Document(physical_box=physical_box, pages=pages, medias=medias)
+        # Template pages are referenced by individual pages via TemplateID;
+        # their content lives in a separate Content.xml that we resolve once
+        # here so the renderer can simply look it up.
+        templates: dict[str, TemplatePage] = {}
+        for tpl_el in doc_el.findall(
+            ".//ofd:CommonData/ofd:TemplatePage", NSMAP
+        ):
+            tpl_id = tpl_el.get("ID")
+            base_loc = tpl_el.get("BaseLoc") or ""
+            if not tpl_id or not base_loc:
+                continue
+            templates[tpl_id] = TemplatePage(
+                template_id=tpl_id,
+                base_loc=_join_doc(doc_dir, base_loc),
+                z_order=tpl_el.get("ZOrder") or "Background",
+            )
 
-    def _collect_medias(self, res_path: str, sink: dict[str, MediaRes]) -> None:
+        return Document(
+            physical_box=physical_box,
+            pages=pages,
+            medias=medias,
+            draw_params=draw_params,
+            templates=templates,
+        )
+
+    def _collect_resources(
+        self,
+        res_path: str,
+        media_sink: dict[str, MediaRes],
+        draw_param_sink: dict[str, DrawParam],
+    ) -> None:
         if not self._container.has(res_path.lstrip("/")):
             return
         res_el = etree.fromstring(self._container.read(res_path.lstrip("/")))
@@ -186,10 +301,31 @@ class OFDReader:
             )
             if not file_path.startswith("/"):
                 file_path = "/" + file_path
-            sink[res_id] = MediaRes(
+            media_sink[res_id] = MediaRes(
                 res_id=res_id,
                 media_type=mm.get("Type") or "Image",
                 file_path=file_path,
+            )
+
+        for dp_el in res_el.findall(".//ofd:DrawParams/ofd:DrawParam", NSMAP):
+            res_id = dp_el.get("ID")
+            if not res_id:
+                continue
+            line_width: Optional[float] = None
+            lw_raw = dp_el.get("LineWidth")
+            if lw_raw:
+                try:
+                    line_width = float(lw_raw)
+                except ValueError:
+                    line_width = None
+            fill_el = dp_el.find("ofd:FillColor", NSMAP)
+            stroke_el = dp_el.find("ofd:StrokeColor", NSMAP)
+            draw_param_sink[res_id] = DrawParam(
+                res_id=res_id,
+                relative=dp_el.get("Relative"),
+                line_width=line_width,
+                fill_color=(fill_el.get("Value") if fill_el is not None else None),
+                stroke_color=(stroke_el.get("Value") if stroke_el is not None else None),
             )
 
 

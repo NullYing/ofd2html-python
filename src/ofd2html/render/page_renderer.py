@@ -22,7 +22,7 @@ from xml.sax.saxutils import escape, quoteattr
 from lxml import etree
 
 from ..gv import NSMAP
-from ..reader.ofd_reader import Box, Document, OFDReader, PageRef
+from ..reader.ofd_reader import Box, Document, DrawParam, OFDReader, PageRef
 from .color import parse_color
 from .path import abbr_data_to_svg_d
 
@@ -47,10 +47,42 @@ def render_page_to_svg(reader: OFDReader, doc: Document, page: PageRef) -> str:
         f'width="{_num(box.w)}mm" height="{_num(box.h)}mm" '
         f'style="background:#fff;display:block;">'
     )
-    # Walk all layers in document order.
-    for layer in page_el.findall(".//ofd:Content/ofd:Layer", NSMAP):
+
+    # OFD page rendering composes three z-bands in order:
+    #   Background templates -> page Body / Body templates -> Foreground
+    # templates. Each band may contain layers from either the template
+    # content or the page itself; any layer with no Type defaults to Body.
+    # Without this, paths defined only in template pages (a common pattern
+    # for form borders/grids) never render and the page looks "border-less".
+    bg: list[etree._Element] = []
+    body: list[etree._Element] = []
+    fg: list[etree._Element] = []
+
+    def _bucket_layers(content_root: etree._Element, default_z: str) -> None:
+        for layer in content_root.findall(".//ofd:Content/ofd:Layer", NSMAP):
+            z = layer.get("Type") or default_z or "Body"
+            if z == "Background":
+                bg.append(layer)
+            elif z == "Foreground":
+                fg.append(layer)
+            else:
+                body.append(layer)
+
+    for tpl_el in page_el.findall("ofd:Template", NSMAP):
+        tpl_id = tpl_el.get("TemplateID")
+        if not tpl_id:
+            continue
+        tpl_root = reader.template_content(doc, tpl_id)
+        if tpl_root is None:
+            continue
+        _bucket_layers(tpl_root, tpl_el.get("ZOrder") or "Background")
+
+    _bucket_layers(page_el, "Body")
+
+    for layer in (*bg, *body, *fg):
+        layer_dp = doc.resolve_draw_param(layer.get("DrawParam"))
         for child in layer:
-            _render_node(child, reader, doc, parts)
+            _render_node(child, reader, doc, parts, layer_dp)
     parts.append("</svg>")
     return "".join(parts)
 
@@ -65,13 +97,20 @@ def _render_node(
     reader: OFDReader,
     doc: Document,
     out: list[str],
+    layer_dp: Optional[DrawParam] = None,
 ) -> None:
+    # lxml exposes XML comments / processing instructions when iterating
+    # element children; their ``.tag`` is a callable, not a string, so guard
+    # before passing to ``etree.QName`` to keep template-page rendering
+    # robust against documents that interleave comments with content.
+    if not isinstance(node.tag, str):
+        return
     tag = etree.QName(node).localname
     if tag == "PageBlock":
         for child in node:
-            _render_node(child, reader, doc, out)
+            _render_node(child, reader, doc, out, layer_dp)
     elif tag == "PathObject":
-        out.append(_render_path_object(node))
+        out.append(_render_path_object(node, doc, layer_dp))
     elif tag == "TextObject":
         out.append(_render_text_object(node))
     elif tag == "ImageObject":
@@ -85,28 +124,64 @@ def _render_node(
 # --------------------------------------------------------------------------- #
 
 
-def _render_path_object(node: etree._Element) -> str:
+def _render_path_object(
+    node: etree._Element,
+    doc: Document,
+    layer_dp: Optional[DrawParam] = None,
+) -> str:
     boundary = Box.parse(node.get("Boundary"))
     ctm = node.get("CTM")
     fill_attr = (node.get("Fill") or "").lower()
     stroke_attr = (node.get("Stroke") or "").lower()
-    line_width = node.get("LineWidth") or "0.353"
 
-    # OFD defaults: when neither Fill nor Stroke is given on a PathObject the
-    # spec defaults Stroke=true.
+    # OFD GB/T 33190-2016 Table 35 (CT_Path):
+    #   Stroke defaults to true, Fill defaults to false.
+    # Earlier this code only enabled stroke when both attrs were absent,
+    # which dropped borders on paths declaring only Fill="true".
     do_fill = fill_attr == "true"
-    do_stroke = stroke_attr == "true" or (fill_attr == "" and stroke_attr == "")
+    do_stroke = stroke_attr != "false"
 
-    fill_color = (
-        parse_color(_xpath_attr(node, "ofd:FillColor", "Value"), "#000000")
-        if do_fill
-        else "none"
-    )
-    stroke_color = (
-        parse_color(_xpath_attr(node, "ofd:StrokeColor", "Value"), "#000000")
-        if do_stroke
-        else "none"
-    )
+    # Resolve DrawParam defaults: layer-level first, then path-level overrides.
+    path_dp = doc.resolve_draw_param(node.get("DrawParam"))
+    dp_line_width: Optional[float] = None
+    dp_fill_raw: Optional[str] = None
+    dp_stroke_raw: Optional[str] = None
+    for dp in (layer_dp, path_dp):
+        if dp is None:
+            continue
+        if dp.line_width is not None:
+            dp_line_width = dp.line_width
+        if dp.fill_color is not None:
+            dp_fill_raw = dp.fill_color
+        if dp.stroke_color is not None:
+            dp_stroke_raw = dp.stroke_color
+
+    # LineWidth precedence: PathObject@LineWidth > DrawParam.LineWidth > 0.353.
+    line_width_attr = node.get("LineWidth")
+    if line_width_attr:
+        line_width = line_width_attr
+    elif dp_line_width is not None:
+        line_width = _num(dp_line_width)
+    else:
+        line_width = "0.353"
+
+    # Color precedence: explicit child element > DrawParam > spec default.
+    fill_value = _xpath_attr(node, "ofd:FillColor", "Value") or dp_fill_raw
+    stroke_value = _xpath_attr(node, "ofd:StrokeColor", "Value") or dp_stroke_raw
+
+    fill_color = parse_color(fill_value, "#000000") if do_fill else "none"
+    if do_stroke:
+        if stroke_value:
+            stroke_color = parse_color(stroke_value, "#000000")
+        elif do_fill and fill_value:
+            # Mirror reference renderer: fall back to the fill colour when no
+            # StrokeColor is supplied -- otherwise a coloured filled shape
+            # would gain a hard black outline.
+            stroke_color = parse_color(fill_value, "#000000")
+        else:
+            stroke_color = "#000000"
+    else:
+        stroke_color = "none"
 
     abbr = _xpath_text(node, "ofd:AbbreviatedData") or ""
     d_attr = abbr_data_to_svg_d(abbr)
