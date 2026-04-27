@@ -5,7 +5,9 @@
 // (we don't need fastapi/uvicorn/pydantic in the browser).
 
 const PYODIDE_INDEX = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-const WHEEL_URL = "./ofd2html-latest.whl";
+// CI writes wheel.txt containing the actual PEP-427 wheel filename
+// (e.g. "ofd2html-0.1.0-py3-none-any.whl"). micropip requires the real name.
+const WHEEL_MANIFEST = "./wheel.txt";
 
 const $ = (id) => document.getElementById(id);
 const status = (msg) => { $("status").textContent = msg; };
@@ -31,10 +33,14 @@ async function boot() {
 
         status("安装 ofd2html…");
         await pyodide.loadPackage("micropip");
+        const wheelName = (await (await fetch(WHEEL_MANIFEST, { cache: "no-cache" })).text()).trim();
+        if (!wheelName) throw new Error("wheel.txt is empty");
+        const wheelUrl = "./" + wheelName;
+        log("[info] wheel = " + wheelName);
         // deps=False: skip fastapi/uvicorn/pydantic (server-side only).
         await pyodide.runPythonAsync(`
 import micropip
-await micropip.install(${JSON.stringify(WHEEL_URL)}, deps=False)
+await micropip.install(${JSON.stringify(wheelUrl)}, deps=False)
 `);
         log("[ok] ofd2html 已安装");
 

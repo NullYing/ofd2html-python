@@ -35,9 +35,11 @@ jobs:
         run: |
           mkdir -p _site
           cp -r web/* _site/
-          # Pick the freshly built wheel and expose it under a stable name.
+          # Keep the wheel's PEP 427 filename intact and write a pointer file
+          # the front-end can fetch to discover it.
           wheel=$(ls dist/ofd2html-*-py3-none-any.whl | head -n1)
-          cp "$wheel" _site/ofd2html-latest.whl
+          cp "$wheel" "_site/$(basename "$wheel")"
+          basename "$wheel" > _site/wheel.txt
           # Disable Jekyll so files starting with _ are served as-is.
           touch _site/.nojekyll
           ls -l _site/

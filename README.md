@@ -2,6 +2,10 @@
 
 OFD → HTML 转换服务，基于 FastAPI。仅支持 OFD 到 HTML 的渲染（签章/PDF/图片导出等不在范围内）。
 
+## 在线使用
+
+[点击跳转](https://nullying.github.io/ofd2html-python/)
+
 ## 安装（开发）
 
 本项目使用 [uv](https://docs.astral.sh/uv/) 作为包管理器：
